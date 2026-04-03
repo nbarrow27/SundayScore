@@ -16,7 +16,7 @@ export default function Home() {
 
   const { data: weeksData } = useQuery({
     queryKey: ["/api/seasons", selectedSeason, "weeks"],
-    queryFn: () => apiRequest("GET", `/api/seasons/${selectedSeason}/weeks`).then(r => r.json()),
+    queryFn: () => apiRequest("GET", `/api/weeks`).then(r => r.json()),
   });
 
   const { data: gamesData, isLoading: gamesLoading } = useQuery({
