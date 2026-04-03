@@ -537,12 +537,30 @@ function gradeOL(stats: any, ctx: { sacks: number; rushYards: number; rushTDs: n
   // Team-level signal: total sacks as context
   // Note: was_pressure from pbp_participation is team-level (same flag for all OL),
   // so it cannot differentiate individual linemen. We use sacks + penalties only.
-  const sacksAllowed = olPlayerData?.sacksAllowed ?? ctx.sacks;
-
-  // Scale by snap count: a starter who played 60 snaps bears more responsibility
-  // than a backup who played 10 snaps
-  const totalSnaps = olPlayerData?.offenseSnaps || olPlayerData?.passSnaps || 0;
-  const isStarter = totalSnaps >= 40;  // played most of the game
+  // sacksAllowed: use individual tracking if we have it, otherwise fall back to
+  // team-level sack count from QB stats. If olPlayerData exists but sacksAllowed === 0
+  // AND the team allowed sacks AND the player played significant snaps, distribute
+  // team sacks evenly (5 starters share blame equally when individual data is absent).
+  // Use the most available snap count: from olPlayerData tracking, or from player-level snapsPlayed
+  const totalSnaps = olPlayerData?.offenseSnaps || olPlayerData?.passSnaps
+    || stats._snapsPlayed || 0;  // stats._snapsPlayed injected below from player.snapsPlayed
+  const isStarter = totalSnaps >= 30;  // played at least half the game
+  let sacksAllowed: number;
+  if (olPlayerData) {
+    // Individual sack tracking from play loop. If we also have team-level sacks (ctx.sacks)
+    // and the individual count is LESS than team total, use the team count as the minimum
+    // (sacks are a UNIT failure — every starter shares the penalty equally).
+    const individualSacks = olPlayerData.sacksAllowed;
+    if (isStarter && ctx.sacks > 0) {
+      // Always use team sack count for starters: individual count can undercount
+      // if the play type parsing missed some sack variants
+      sacksAllowed = Math.max(individualSacks, ctx.sacks);
+    } else {
+      sacksAllowed = individualSacks;
+    }
+  } else {
+    sacksAllowed = isStarter ? ctx.sacks : 0;
+  }
 
   // Sack penalty (shared across all starters)
   // Each starter gets the same sack deduction since we can't identify who was beaten
@@ -1884,13 +1902,18 @@ export async function fetchGameData(gameId: string, forceRefresh = false): Promi
 
       // All OL IDs per team (for unit-level sack distribution)
       const teamOLByPos: Record<string, Record<string, string[]>> = {};
+      // Also build a flat list of all OL starters per team for sack fallback
+      const teamOLStarters: Record<string, string[]> = {};
       for (const [teamId, players] of Object.entries(teamPlayers)) {
         teamOLByPos[teamId] = {};
+        teamOLStarters[teamId] = [];
         for (const player of players as any[]) {
-          const pos = player.position?.toUpperCase();
+          // Use athletePositionMap first — roster-only OL have position set there
+          const pos = (athletePositionMap[player.id] || player.position || "").toUpperCase();
           if (["OT","G","C","OG","OL"].includes(pos)) {
             if (!teamOLByPos[teamId][pos]) teamOLByPos[teamId][pos] = [];
             teamOLByPos[teamId][pos].push(player.id);
+            teamOLStarters[teamId].push(player.id);
           }
         }
       }
@@ -1946,15 +1969,15 @@ export async function fetchGameData(gameId: string, forceRefresh = false): Promi
         // Sacks are a UNIT failure: shared penalty across all 5 OL starters
         // (No free API can tell us which specific lineman was beaten on a sack)
         // FTN: is_qb_fault_sack = QB scrambled into pressure (OL not at fault)
-        if (playType === "Sack") {
+        if (playType === "Sack" || playType === "Sack Opp Fumble Recovery" || (playType === "Penalty" && textLower.includes("sacked"))) {
           const isQbFaultSack = ftnRow?.is_qb_fault_sack === "TRUE";
           if (!isQbFaultSack) {
             // Only charge starters (players with significant snaps), not backups
             const slots = teamOLSlot[offTeamId] || {};
             const starterIds = ["LT","RT","LG","RG","C"].map(s => slots[s]).filter(Boolean) as string[];
-            // If depth chart didn't load, fall back to all OL
+            // If depth chart didn't load, fall back to all OL starters
             const toCharge = starterIds.length > 0 ? starterIds
-              : Object.values(teamOLByPos[offTeamId] || {}).flat();
+              : teamOLStarters[offTeamId] || Object.values(teamOLByPos[offTeamId] || {}).flat();
             for (const pid of toCharge) {
               getOrInitOL(pid).sacksAllowed += 1;
             }
@@ -2002,13 +2025,13 @@ export async function fetchGameData(gameId: string, forceRefresh = false): Promi
         // ── PASS SNAPS (count individual pass protection volume) ─────────────
         // was_pressure is play-level (team signal), not individual
         // We track pass snaps per individual for snap-count weighting only
-        if (["Pass Reception", "Pass Incompletion", "Sack"].includes(playType)) {
+        if (["Pass Reception", "Pass Incompletion", "Sack", "Sack Opp Fumble Recovery", "Passing Touchdown", "Pass Interception Return"].includes(playType) || (playType === "Penalty" && textLower.includes("sacked"))) {
           const nBlitzers = parseInt(ftnRow?.n_blitzers || "0");
           const wasBlitzed = nBlitzers >= 5;
           const slots = teamOLSlot[offTeamId] || {};
           const starterIds = ["LT","RT","LG","RG","C"].map(s => slots[s]).filter(Boolean) as string[];
           const allOL = starterIds.length > 0 ? starterIds
-            : Object.values(teamOLByPos[offTeamId] || {}).flat();
+            : teamOLStarters[offTeamId] || Object.values(teamOLByPos[offTeamId] || {}).flat();
           for (const pid of allOL) {
             const s = getOrInitOL(pid);
             s.passSnaps += 1;
@@ -2149,6 +2172,10 @@ export async function fetchGameData(gameId: string, forceRefresh = false): Promi
                 }
               }
             }
+
+            // Attach depth slot (LT/LG/C/RG/RT) so client can order OL correctly
+            const slot = espnIdToOLSlot[player.id];
+            if (slot) player.depthSlot = slot;
 
             player._olStats = base;
           }
@@ -2324,7 +2351,11 @@ export async function fetchGameData(gameId: string, forceRefresh = false): Promi
             player.defenseSnapsPlayed = null;
           }
 
+          // Inject snapsPlayed into stats so gradeOL can use it for isStarter check
+          if (!player.stats) player.stats = {};
+          player.stats._snapsPlayed = player.snapsPlayed || 0;
           player.sundayScore = computeSundayScore(player);
+          delete player.stats._snapsPlayed; // clean up internal field
         }
       }
 
@@ -2353,19 +2384,6 @@ export async function fetchGameData(gameId: string, forceRefresh = false): Promi
         players: teamPlayers,
       };
 
-      // Strip internal private fields before serializing
-      for (const players of Object.values(result.players as Record<string, any[]>)) {
-        for (const p of players) {
-          delete p._teamCtx;
-          delete p._olStats;
-          delete p._cbStats;
-          delete p._wrStats;
-          delete p._lbStats;
-          delete p._dlStats;
-        }
-      }
-
-      // Cache it
 
   setCached(gameId, JSON.stringify(result));
   return result;
