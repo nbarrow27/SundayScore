@@ -233,9 +233,6 @@ function getAvailableSeasons() {
   return seasons;
 }
 
-// ============================================================
-// SUNDAY SCORE ALGORITHM
-// ============================================================
 function computeSundayScore(player: any): number {
   const stats = player.stats || {};
   const pos = player.position || "?";
@@ -250,17 +247,17 @@ function computeSundayScore(player: any): number {
   } else if (pos === "RB" || pos === "FB") {
     score = gradeRB(stats);
   } else if (pos === "WR" || pos === "TE") {
-    score = gradeWRTE(stats);
+    score = gradeWRTE(stats, player._wrStats);
   } else if (pos === "C" || pos === "G" || pos === "T" || pos === "OL" || pos === "OT" || pos === "OG" || pos === "LS") {
     score = gradeOL(stats, teamCtx, player._olStats);
   } else if (pos === "DE" || pos === "DT" || pos === "NT" || pos === "DL" || pos === "IDL" || pos === "ED") {
-    score = gradeDL(stats);
+    score = gradeDL(stats, player._dlStats);
   } else if (pos === "LB" || pos === "ILB" || pos === "OLB" || pos === "MLB") {
-    score = gradeLB(stats);
+    score = gradeLB(stats, player._lbStats);
   } else if (pos === "CB") {
     score = gradeCB(stats, player._cbStats);
   } else if (pos === "S" || pos === "SS" || pos === "FS" || pos === "SAF") {
-    score = gradeSafety(stats);
+    score = gradeSafety(stats, player._dlStats); // safeties share pass rush data
   } else if (pos === "K") {
     score = gradeKicker(stats);
   } else if (pos === "P") {
@@ -417,9 +414,17 @@ function gradeRB(stats: any): number {
   return score;
 }
 
-function gradeWRTE(stats: any): number {
+function gradeWRTE(stats: any, wrPlayerData?: any): number {
+  // WR/TE grading uses two tiers:
+  //   1. ESPN box score stats (always available)
+  //   2. nflverse enrichment: YAC, created receptions (FTN), air yards, routes run
+  //
+  // Key insight: a WR who runs precise routes creating separation (is_created_reception)
+  // even without huge yardage should score higher than one who pads stats on screens.
+  // YAC reflects both route running AND run-after-catch ability.
+
   const receiving = stats.receiving || {};
-  const rushing = stats.rushing || {}; // end-arounds etc
+  const rushing = stats.rushing || {};
   const fumbles = stats.fumbles || {};
 
   const rec = parseNum(receiving["REC"]);
@@ -427,50 +432,91 @@ function gradeWRTE(stats: any): number {
   const recTds = parseNum(receiving["TD"]);
   const targets = parseNum(receiving["TGTS"]);
   const avg = rec > 0 ? recYards / rec : 0;
-
   const catchRate = targets > 0 ? rec / targets : 1;
   const fumbles_lost = parseNum(fumbles["LOST"]);
+
+  // nflverse enrichment
+  const yac = wrPlayerData?.yac ?? 0;
+  const createdReceptions = wrPlayerData?.createdReceptions ?? 0;
+  const airYards = wrPlayerData?.airYards ?? 0;      // intended air yards on targets
+  const drops = wrPlayerData?.drops ?? 0;
+  const firstDowns = wrPlayerData?.firstDowns ?? 0;
+  const hasRichData = wrPlayerData && wrPlayerData.targets !== undefined;
 
   let score = 5.0;
 
   if (targets > 0 || rec > 0) {
-    // Receiving yards
-    if (recYards >= 150) score += 3.0;
-    else if (recYards >= 120) score += 2.5;
-    else if (recYards >= 100) score += 2.0;
-    else if (recYards >= 80) score += 1.5;
-    else if (recYards >= 60) score += 1.0;
-    else if (recYards >= 40) score += 0.6;
-    else if (recYards >= 20) score += 0.3;
+    // ── 1. RECEIVING YARDS (primary volume signal) ─────────────────────────────
+    if (recYards >= 150) score += 3.2;
+    else if (recYards >= 120) score += 2.6;
+    else if (recYards >= 100) score += 2.1;
+    else if (recYards >= 80)  score += 1.6;
+    else if (recYards >= 60)  score += 1.1;
+    else if (recYards >= 40)  score += 0.7;
+    else if (recYards >= 20)  score += 0.3;
 
-    // Reception efficiency
-    score += rec * 0.2;
+    // ── 2. RECEPTIONS (volume) ─────────────────────────────────────────────────
+    score += Math.min(rec * 0.2, 1.0);
 
-    // TDs
-    score += recTds * 1.2;
+    // ── 3. TOUCHDOWNS ──────────────────────────────────────────────────────────
+    score += recTds * 1.4;
 
-    // Yards per reception
-    if (avg >= 18) score += 0.5;
-    else if (avg >= 13) score += 0.2;
+    // ── 4. YARDS PER RECEPTION (big-play efficiency) ───────────────────────────
+    if (avg >= 20) score += 0.8;
+    else if (avg >= 16) score += 0.5;
+    else if (avg >= 12) score += 0.2;
 
-    // Catch rate (efficiency / route running proxy)
+    // ── 5. CATCH RATE (route precision / QB trust) ─────────────────────────────
     if (targets >= 4) {
-      if (catchRate >= 0.80) score += 0.5;
-      else if (catchRate >= 0.70) score += 0.2;
-      else if (catchRate < 0.40) score -= 0.4;
+      if (catchRate >= 0.85) score += 0.7;
+      else if (catchRate >= 0.75) score += 0.4;
+      else if (catchRate >= 0.65) score += 0.1;
+      else if (catchRate < 0.40)  score -= 0.5;
+    }
+
+    // ── 6. NFLVERSE ENRICHMENT ─────────────────────────────────────────────────
+    if (hasRichData) {
+      // YAC per reception — measures RAC ability and route running after the catch
+      const yacPerRec = rec > 0 ? yac / rec : 0;
+      if (yacPerRec >= 8)      score += 0.6; // exceptional YAC
+      else if (yacPerRec >= 5) score += 0.3;
+      else if (yacPerRec >= 3) score += 0.1;
+
+      // Created receptions — FTN credits WR for beating coverage, not just catching easy balls
+      // A high created% = separated from coverage through route or RAC
+      const createdPct = rec > 0 ? createdReceptions / rec : 0;
+      if (createdPct >= 0.5 && rec >= 3) score += 0.5;
+      else if (createdPct >= 0.3 && rec >= 2) score += 0.2;
+
+      // First downs — sustain drives
+      score += Math.min(firstDowns * 0.15, 0.5);
+
+      // Air yards per target — downfield threat bonus (getting open deep)
+      const airYardsPerTarget = targets > 0 ? airYards / targets : 0;
+      if (airYardsPerTarget >= 15) score += 0.4; // consistently targeted deep
+      else if (airYardsPerTarget >= 10) score += 0.2;
+
+      // Drops penalize the player specifically
+      score -= drops * 0.8;
     }
   } else {
-    // No targets — slight penalty (ran routes but wasn't targeted, neutral)
-    score = 5.5; // baseline for a player who blocked well
+    // No targets — player may have run decoy routes, cleared space, or blocked
+    score = 5.0;
+    // If we have route data showing they were on the field but just not targeted,
+    // give a small baseline for contributions we can't fully measure
+    if (hasRichData && (wrPlayerData.routes || 0) > 10) score = 5.3;
   }
 
-  // Rushing bonus (jet sweeps, end arounds)
+  // ── 7. RUSHING (jet sweeps, end-arounds) ───────────────────────────────────
   const rushYards = parseNum(rushing["YDS"]);
-  if (rushYards > 0) score += Math.min(rushYards * 0.02, 0.5);
+  if (rushYards > 0) score += Math.min(rushYards * 0.025, 0.6);
+  const rushTDs = parseNum(rushing["TD"]);
+  score += rushTDs * 1.2;
 
-  score -= fumbles_lost * 1.5;
+  // ── 8. FUMBLES ─────────────────────────────────────────────────────────────
+  score -= fumbles_lost * 1.8;
 
-  return score;
+  return Math.max(1.0, Math.min(10.0, score));
 }
 
 function gradeOL(stats: any, ctx: { sacks: number; rushYards: number; rushTDs: number; rushCarries: number }, olPlayerData?: any): number {
@@ -574,44 +620,58 @@ function gradeOL(stats: any, ctx: { sacks: number; rushYards: number; rushTDs: n
   return score;
 }
 
-function gradeDL(stats: any): number {
-  const defensive = stats.defensive || {};
+function gradeDL(stats: any, dlPlayerData?: any): number {
+  // DL grading: pass rush is the primary grade (sacks + QB hits + pressures).
+  // Run stop (TFLs, tackles) is secondary but important for NT/IDL.
+  // nflverse qb_hit_1/2 gives us pressures even when no sack occurs.
 
+  const defensive = stats.defensive || {};
   const totalTackles = parseNum(defensive["TOT"]);
-  const soloTackles = parseNum(defensive["SOLO"]);
   const sacks = parseNum(defensive["SACKS"]);
   const tfl = parseNum(defensive["TFL"]);
   const pd = parseNum(defensive["PD"]);
-  const qbHits = parseNum(defensive["QB HTS"]);
+  const qbHitsEspn = parseNum(defensive["QB HTS"]);
   const defTd = parseNum(defensive["TD"]);
+
+  // nflverse enrichment
+  const nflQbHits = dlPlayerData?.qbHits ?? 0;
+  const nflTfl = dlPlayerData?.tfl ?? 0;
+  const nflSacks = dlPlayerData?.sacksContributed ?? 0;
+  const nflForcedFumbles = dlPlayerData?.forcedFumbles ?? 0;
+  const hasRichData = dlPlayerData !== undefined;
+
+  const effectiveSacks = hasRichData ? Math.max(sacks, nflSacks) : sacks;
+  const effectiveQbHits = hasRichData ? Math.max(qbHitsEspn, nflQbHits) : qbHitsEspn;
+  const effectiveTfl = hasRichData ? Math.max(tfl, nflTfl) : tfl;
 
   let score = 5.5;
 
-  // Sacks are elite pass rush events
-  score += sacks * 1.5;
+  // ── 1. PASS RUSH (primary for edge rushers) ───────────────────────────────
+  score += effectiveSacks * 1.8;     // Sacks are the gold standard
+  score += effectiveQbHits * 0.55;   // Hit without sack = still disrupted QB
+  score += nflForcedFumbles * 0.9;   // Forced fumble = huge play
 
-  // QB hits (pressures proxy)
-  score += qbHits * 0.5;
-
-  // TFLs (tackles for loss — run stopping)
-  score += tfl * 0.6;
-
-  // General tackles
-  if (totalTackles >= 10) score += 0.8;
-  else if (totalTackles >= 7) score += 0.5;
+  // ── 2. RUN STOP (TFLs + tackles) ────────────────────────────────────────
+  score += effectiveTfl * 0.7;
+  if (totalTackles >= 10) score += 0.9;
+  else if (totalTackles >= 7) score += 0.6;
   else if (totalTackles >= 5) score += 0.3;
   else if (totalTackles >= 3) score += 0.1;
 
-  // Pass defensed
+  // ── 3. COVERAGE / MISC ───────────────────────────────────────────────────
   score += pd * 0.4;
-
-  // Defensive TD
   score += defTd * 2.0;
 
-  return score;
+  return Math.max(1.0, Math.min(10.0, score));
 }
 
-function gradeLB(stats: any): number {
+function gradeLB(stats: any, lbPlayerData?: any): number {
+  // LB grading uses both ESPN box score AND nflverse pass rusher stats:
+  //   - qb_hit_1/2_player_name: pressures/hits without a full sack (LB pass rush)
+  //   - tackle_for_loss_1/2: key run stop metric
+  //   - forced_fumble: disruption
+  // LBs are evaluated across 3 dimensions: tackle, pass rush, coverage
+
   const defensive = stats.defensive || {};
   const interceptions = stats.interceptions || {};
 
@@ -619,36 +679,46 @@ function gradeLB(stats: any): number {
   const sacks = parseNum(defensive["SACKS"]);
   const tfl = parseNum(defensive["TFL"]);
   const pd = parseNum(defensive["PD"]);
-  const qbHits = parseNum(defensive["QB HTS"]);
+  const qbHitsEspn = parseNum(defensive["QB HTS"]);
   const defTd = parseNum(defensive["TD"]);
-
   const ints = parseNum(interceptions["INT"]);
+
+  // nflverse enrichment: more granular pass rush / disruption stats
+  const nflQbHits = lbPlayerData?.qbHits ?? 0;
+  const nflTfl = lbPlayerData?.tfl ?? 0;
+  const nflSacks = lbPlayerData?.sacksContributed ?? 0;
+  const nflForcedFumbles = lbPlayerData?.forcedFumbles ?? 0;
+  const hasRichData = lbPlayerData !== undefined;
+
+  // Use best available (nflverse > ESPN, take max to avoid double-penalty)
+  const effectiveQbHits = hasRichData ? Math.max(qbHitsEspn, nflQbHits) : qbHitsEspn;
+  const effectiveTfl = hasRichData ? Math.max(tfl, nflTfl) : tfl;
+  const effectiveSacks = hasRichData ? Math.max(sacks, nflSacks) : sacks;
 
   let score = 5.5;
 
-  // Tackles — LBs are expected to make many
-  if (totalTackles >= 15) score += 1.5;
-  else if (totalTackles >= 12) score += 1.2;
-  else if (totalTackles >= 10) score += 0.8;
-  else if (totalTackles >= 8) score += 0.5;
-  else if (totalTackles >= 5) score += 0.2;
-  else if (totalTackles < 3) score -= 0.3;
+  // ── 1. TACKLES (run stopping, pursuit) ──────────────────────────────────────
+  // LBs are expected to make many tackles — this is table stakes
+  if (totalTackles >= 15) score += 1.8;
+  else if (totalTackles >= 12) score += 1.4;
+  else if (totalTackles >= 10) score += 1.0;
+  else if (totalTackles >= 8)  score += 0.6;
+  else if (totalTackles >= 6)  score += 0.3;
+  else if (totalTackles >= 4)  score += 0.1;
+  else if (totalTackles < 3)   score -= 0.4;
 
-  // Sacks
-  score += sacks * 1.5;
+  // ── 2. PASS RUSH (sacks, QB hits, TFLs) ───────────────────────────────────
+  score += effectiveSacks * 1.6;
+  score += effectiveQbHits * 0.45;    // QB hits without sack still disrupt offense
+  score += effectiveTfl * 0.8;        // TFLs = elite run defense
+  score += nflForcedFumbles * 0.8;    // Disruption bonus
 
-  // QB hits
-  score += qbHits * 0.4;
-
-  // TFLs
-  score += tfl * 0.7;
-
-  // Coverage plays
+  // ── 3. COVERAGE (PDs, INTs) ────────────────────────────────────────────────
   score += pd * 0.5;
-  score += ints * 1.5;
+  score += ints * 1.8;
   score += defTd * 2.0;
 
-  return score;
+  return Math.max(1.0, Math.min(10.0, score));
 }
 
 function gradeCB(stats: any, cbPlayerData?: any): number {
@@ -776,7 +846,10 @@ function gradeCB(stats: any, cbPlayerData?: any): number {
   return score;
 }
 
-function gradeSafety(stats: any): number {
+function gradeSafety(stats: any, safetyPlayerData?: any): number {
+  // Safeties are evaluated across coverage + tackling + occasional pass rush.
+  // nflverse qb_hit data helps capture blitz/safety blitz contributions.
+
   const defensive = stats.defensive || {};
   const interceptions = stats.interceptions || {};
 
@@ -784,33 +857,40 @@ function gradeSafety(stats: any): number {
   const sacks = parseNum(defensive["SACKS"]);
   const tfl = parseNum(defensive["TFL"]);
   const pd = parseNum(defensive["PD"]);
-  const qbHits = parseNum(defensive["QB HTS"]);
+  const qbHitsEspn = parseNum(defensive["QB HTS"]);
   const defTd = parseNum(defensive["TD"]);
-
   const ints = parseNum(interceptions["INT"]);
+
+  // nflverse enrichment (blitzes, forced fumbles)
+  const nflQbHits = safetyPlayerData?.qbHits ?? 0;
+  const nflForcedFumbles = safetyPlayerData?.forcedFumbles ?? 0;
+  const nflSacks = safetyPlayerData?.sacksContributed ?? 0;
+  const nflTfl = safetyPlayerData?.tfl ?? 0;
+  const effectiveQbHits = Math.max(qbHitsEspn, nflQbHits);
+  const effectiveSacks = Math.max(sacks, nflSacks);
+  const effectiveTfl = Math.max(tfl, nflTfl);
 
   let score = 5.5;
 
-  // Safeties contribute in both run and pass
-  if (totalTackles >= 12) score += 1.2;
-  else if (totalTackles >= 9) score += 0.8;
-  else if (totalTackles >= 7) score += 0.5;
-  else if (totalTackles >= 5) score += 0.2;
+  // ── 1. TACKLES (safeties are key tacklers in the middle) ─────────────────────
+  if (totalTackles >= 12) score += 1.3;
+  else if (totalTackles >= 9)  score += 0.9;
+  else if (totalTackles >= 7)  score += 0.6;
+  else if (totalTackles >= 5)  score += 0.3;
+  else if (totalTackles >= 3)  score += 0.1;
 
-  // Pass defensed
+  // ── 2. COVERAGE (PDs, INTs — the premium output) ─────────────────────────
   score += pd * 0.7;
   score += ints * 2.0;
-
-  // TFLs
-  score += tfl * 0.5;
-
-  // QB hits / pass rush
-  score += qbHits * 0.4;
-  score += sacks * 1.2;
-
   score += defTd * 2.0;
 
-  return score;
+  // ── 3. PASS RUSH / DISRUPTION (blitzing safety) ─────────────────────────
+  score += effectiveSacks * 1.3;
+  score += effectiveQbHits * 0.4;
+  score += nflForcedFumbles * 0.8;
+  score += effectiveTfl * 0.5;
+
+  return Math.max(1.0, Math.min(10.0, score));
 }
 
 function gradeKicker(stats: any): number {
@@ -890,13 +970,12 @@ function gradeGenericDef(stats: any): number {
   return score;
 }
 
-// ── Main game data fetcher ───────────────────────────────────────────────────
+// ── Main game data fetcher ────────────────────────────────────────────────────
 export async function fetchGameData(gameId: string, forceRefresh = false): Promise<any> {
   if (!forceRefresh) {
     const cached = getCached(gameId);
     if (cached) return JSON.parse(cached.data);
   }
-
       // Fetch from ESPN
       const summaryUrl = `${ESPN_BASE}/summary?event=${gameId}`;
       const summaryData = await fetchJson(summaryUrl);
@@ -1184,6 +1263,291 @@ export async function fetchGameData(gameId: string, forceRefresh = false): Promi
       const pbpByNflversePlayId: Record<string, Record<string, string>> = {};
       for (const row of pbpRows) {
         pbpByNflversePlayId[row["play_id"]] = row;
+      }
+
+      // ── Pre-build WR/TE route stats from participation ──────────────────────
+      // participation.route = route run per play (GO, SLANT, CROSS, OUT, etc.)
+      // is_created_reception = WR created the catch through separation (FTN)
+      // yards_after_catch = YAC from PBP (YAC = YAC skill, not just catching)
+      const wrStatsFromNflverse: Record<string, {
+        routes: number;          // total routes run
+        targets: number;         // times targeted
+        receptions: number;      // catches
+        yards: number;           // receiving yards
+        yac: number;             // yards after catch
+        airYards: number;        // intended air yards on targets
+        tds: number;
+        drops: number;           // FTN is_drop
+        createdReceptions: number; // FTN is_created_reception — separated to create catch
+        firstDowns: number;
+        routeTypes: Record<string, number>; // route type counts
+      }> = {};
+
+      function getWR(name: string) {
+        if (!wrStatsFromNflverse[name]) wrStatsFromNflverse[name] = {
+          routes: 0, targets: 0, receptions: 0, yards: 0, yac: 0, airYards: 0,
+          tds: 0, drops: 0, createdReceptions: 0, firstDowns: 0, routeTypes: {},
+        };
+        return wrStatsFromNflverse[name];
+      }
+
+      // ── Pre-build defender coverage stats from participation ─────────────────
+      // defense_names: semicolon-separated list of GSIS IDs for defenders on play
+      // defense_positions: semicolon-separated positions matching defense_names order
+      // This lets us find the CB/S covering the targeted receiver precisely.
+      // Strategy: on a pass play, the defender closest to the receiver = coverage defender.
+      // We use defense_names + defense_positions to build a gsis_id → position map per play,
+      // then match targeted receiver's coverage defender via pass_defense_1_player_name on PDs,
+      // or solo_tackle on completions (same as before, but now we ALSO track coverage snaps by
+      // defender type — man coverage snaps, zone coverage snaps, blitz snaps).
+      const defenderCoverageSnaps: Record<string, {
+        manCoverageSnaps: number;
+        zoneCoverageSnaps: number;
+        blitzSnaps: number;
+        passRushSnaps: number;   // in box/rushing
+        coverageTackles: number; // tackles in coverage (vs box tackles)
+      }> = {};
+
+      function getDefCov(gsisId: string) {
+        if (!defenderCoverageSnaps[gsisId]) defenderCoverageSnaps[gsisId] = {
+          manCoverageSnaps: 0, zoneCoverageSnaps: 0, blitzSnaps: 0,
+          passRushSnaps: 0, coverageTackles: 0,
+        };
+        return defenderCoverageSnaps[gsisId];
+      }
+
+      // ── Pre-build LB / pass rusher stats from PBP ───────────────────────────
+      // qb_hit_1/2_player_name = pressures/hits even without a sack
+      // tackle_for_loss_1/2_player_name = TFLs (key for LB run stop grade)
+      const passRusherStats: Record<string, {
+        qbHits: number;
+        sacksContributed: number;
+        tfl: number;
+        forcedFumbles: number;
+      }> = {};
+
+      function getPR(name: string) {
+        if (!passRusherStats[name]) passRusherStats[name] = {
+          qbHits: 0, sacksContributed: 0, tfl: 0, forcedFumbles: 0,
+        };
+        return passRusherStats[name];
+      }
+
+      if (pbpRows.length > 0) {
+        for (const row of pbpRows) {
+          const playType = row["play_type"];
+          const isPass = row["pass_attempt"] === "1";
+          const isRush = row["rush_attempt"] === "1";
+          const isSack = row["sack"] === "1";
+          const partRow = partByPlayId[row["play_id"]];
+
+          // ── WR/TE route stats ──────────────────────────────────────────────
+          if (isPass && !isSack && row["qb_kneel"] !== "1") {
+            const receiverName = row["receiver_player_name"] || "";
+            const isComplete = row["complete_pass"] === "1";
+            const isInterception = row["interception"] === "1";
+            const yds = parseFloat(row["yards_gained"] || "0");
+            const yac = parseFloat(row["yards_after_catch"] || "0");
+            const airYds = parseFloat(row["air_yards"] || "0");
+            const isTD = row["pass_touchdown"] === "1";
+            const ftnR = ftnByPlayId[row["play_id"]];
+            const isDrop = ftnR?.is_drop === "TRUE";
+            const isCreated = ftnR?.is_created_reception === "TRUE";
+            const isFirstDown = row["first_down_pass"] === "1";
+
+            if (receiverName) {
+              const w = getWR(receiverName);
+              w.targets += 1;
+              w.airYards += airYds;
+              if (isComplete) {
+                w.receptions += 1;
+                w.yards += Math.max(0, yds);
+                w.yac += Math.max(0, yac);
+                if (isTD) w.tds += 1;
+                if (isCreated) w.createdReceptions += 1;
+                if (isFirstDown) w.firstDowns += 1;
+              }
+              if (isDrop) w.drops += 1;
+            }
+
+            // Route type from participation (per receiver's route on this play)
+            if (partRow && receiverName) {
+              const route = partRow["route"] || "";
+              if (route && receiverName) {
+                const w = getWR(receiverName);
+                w.routes += 1;
+                w.routeTypes[route] = (w.routeTypes[route] || 0) + 1;
+              }
+            }
+          }
+
+          // ── LB / DL pass rush stats ─────────────────────────────────────────
+          if (row["qb_hit"] === "1") {
+            const h1 = row["qb_hit_1_player_name"];
+            const h2 = row["qb_hit_2_player_name"];
+            if (h1) getPR(h1).qbHits += 1;
+            if (h2) getPR(h2).qbHits += 1;
+          }
+          if (isSack) {
+            // Credit all sack contributors
+            const s1 = row["solo_tackle_1_player_name"] || row["sack_player_name"];
+            const s2 = row["solo_tackle_2_player_name"] || row["half_sack_1_player_name"];
+            if (s1) getPR(s1).sacksContributed += 1;
+            if (s2) getPR(s2).sacksContributed += 0.5;
+          }
+          if (row["tackled_for_loss"] === "1" || row["tackle_for_loss"] === "1") {
+            const t1 = row["tackle_for_loss_1_player_name"];
+            const t2 = row["tackle_for_loss_2_player_name"];
+            if (t1) getPR(t1).tfl += 1;
+            if (t2) getPR(t2).tfl += 0.5;
+          }
+          const ff1 = row["forced_fumble_player_1_player_name"];
+          const ff2 = row["forced_fumble_player_2_player_name"];
+          if (ff1) getPR(ff1).forcedFumbles += 1;
+          if (ff2) getPR(ff2).forcedFumbles += 1;
+
+          // ── Defender coverage snap type (man/zone/blitz) ───────────────────
+          if (partRow && (isPass || isRush)) {
+            const defGsisIds = (partRow["defense_players"] || "").split(";").filter(Boolean);
+            const defPositions = (partRow["defense_positions"] || "").split(";").filter(Boolean);
+            const covType = partRow["defense_man_zone_type"] || "";
+            const nBlitz = parseInt(partRow["number_of_pass_rushers"] || ftnByPlayId[row["play_id"]]?.n_pass_rushers || "4");
+            const isBlitzPlay = nBlitz > 4;
+
+            defGsisIds.forEach((gsisId, i) => {
+              const pos = (defPositions[i] || "").toUpperCase();
+              if (!gsisId) return;
+              const d = getDefCov(gsisId);
+              // Determine if this defender is in coverage or pass rush
+              const isCoveragePos = ["CB","FS","SS","S","DB","LCB","RCB","NCB"].includes(pos);
+              const isPassRushPos = ["DE","DT","NT","OLB","ILB","MLB"].includes(pos);
+              if (isPass) {
+                if (isCoveragePos) {
+                  if (covType.includes("MAN")) d.manCoverageSnaps += 1;
+                  else d.zoneCoverageSnaps += 1;
+                  if (isBlitzPlay) d.blitzSnaps += 1;
+                } else if (isPassRushPos) {
+                  d.passRushSnaps += 1;
+                }
+              }
+            });
+          }
+        }
+
+        // ── Count routes run from participation (for WRs not targeted) ────────
+        // participation.route is the route this specific player ran on this play
+        // We need to match offense_names/offense_positions to track per receiver
+        for (const partRow of participationRows) {
+          const pbpRow = pbpByNflversePlayId[partRow["play_id"]];
+          if (!pbpRow || pbpRow["pass_attempt"] !== "1") continue;
+          const offNames = (partRow["offense_names"] || "").split(";").filter(Boolean);
+          const offPositions = (partRow["offense_positions"] || "").split(";").filter(Boolean);
+          const route = partRow["route"] || "";
+          // route in participation is ONLY for the targeted/charted receiver, not all
+          // So routes per player come from counting their participation snaps on pass plays
+          // Use offense_players (GSIS IDs) with offense_positions to count WR pass snap routes
+          const offGsisIds = (partRow["offense_players"] || "").split(";").filter(Boolean);
+          offGsisIds.forEach((gsisId, i) => {
+            const pos = (offPositions[i] || "").toUpperCase();
+            if (["WR","TE","FB","RB"].includes(pos)) {
+              // This player was on the field for a pass play = ran a route
+              // We'll count this as a route run for the player (by GSIS, merged later)
+              // Store by GSIS ID for now — will merge to ESPN player in scoring loop
+              const name = offNames[i] || "";
+              if (name) {
+                const w = getWR(name);
+                // Only count if not already counted as a target on this play
+                // routes field will be set from target count + non-target snaps
+                w.routes += 0; // will reconcile below
+              }
+            }
+          });
+        }
+      }
+
+      // ── Pre-build per-player pass snap count from participation ──────────────
+      // OVERWRITE the simpler tracking done previously with the full participation loop
+      // (this block was previously only counting GSIS IDs from defense_players)
+      const playerOffPassSnaps: Record<string, number> = {}; // espnId -> pass snaps (offense)
+      const playerDefPassSnaps: Record<string, number> = {}; // espnId -> pass snaps (defense)
+      const playerDefTotalSnaps: Record<string, number> = {}; // espnId -> total def snaps
+
+      // Also build gsis -> jersey -> espnId bridge from participation
+      const gsisToJersey: Record<string, string> = {}; // gsis -> jersey number
+      const jerseyTeamToEspnId: Record<string, string> = {}; // jersey:teamAbbr -> espnId
+
+      // Build jersey bridge from participation offense/defense numbers
+      for (const row of participationRows) {
+        const offGsis = (row["offense_players"] || "").split(";").filter(Boolean);
+        const offNums = (row["offense_numbers"] || "").split(";").filter(Boolean);
+        const defGsis = (row["defense_players"] || "").split(";").filter(Boolean);
+        const defNums = (row["defense_numbers"] || "").split(";").filter(Boolean);
+        offGsis.forEach((gsis, i) => { if (offNums[i]) gsisToJersey[gsis] = offNums[i]; });
+        defGsis.forEach((gsis, i) => { if (defNums[i]) gsisToJersey[gsis] = defNums[i]; });
+      }
+
+      // Build jersey+team -> ESPN player ID map from teamPlayers
+      // teamAbbr[teamId] = abbreviation, abbrToTeamId[abbr] = teamId (built at ~line 1073)
+      // These are defined later in the code but the loop below runs after that point
+      // so we re-derive them here from competition data directly
+      const _teamAbbrMap: Record<string, string> = {}; // teamId -> abbr
+      for (const comp of (competition?.competitors || [])) {
+        const tid = String(comp.team?.id);
+        const abbr = comp.team?.abbreviation || "";
+        if (tid && abbr) _teamAbbrMap[tid] = abbr;
+      }
+
+      for (const [teamId, players] of Object.entries(teamPlayers)) {
+        const abbr = _teamAbbrMap[teamId] || teamId;
+        for (const player of players as any[]) {
+          if (player.jersey) {
+            jerseyTeamToEspnId[`${player.jersey}:${abbr}`] = player.id;
+            jerseyTeamToEspnId[`${player.jersey}:${teamId}`] = player.id;
+          }
+        }
+      }
+
+      // Determine the two team abbreviations in this game
+      const _gameTeamAbbrs = Object.values(_teamAbbrMap); // [abbr1, abbr2]
+
+      // Count pass snaps per player from participation
+      for (const partRow of participationRows) {
+        const pbpRow = pbpByNflversePlayId[partRow["play_id"]];
+        if (!pbpRow) continue;
+        const isPassPlay = pbpRow["pass_attempt"] === "1" && pbpRow["sack"] !== "1";
+        const possTeam = partRow["possession_team"] || "";
+        // Defense team = the other team in this game
+        const defTeamAbbr = _gameTeamAbbrs.find(a => a !== possTeam) || "";
+        const possTeamId = Object.entries(_teamAbbrMap).find(([, a]) => a === possTeam)?.[0] || "";
+        const defTeamId = Object.entries(_teamAbbrMap).find(([, a]) => a === defTeamAbbr)?.[0] || "";
+
+        const offGsis = (partRow["offense_players"] || "").split(";").filter(Boolean);
+        const defGsis = (partRow["defense_players"] || "").split(";").filter(Boolean);
+        const offNums = (partRow["offense_numbers"] || "").split(";").filter(Boolean);
+        const defNums = (partRow["defense_numbers"] || "").split(";").filter(Boolean);
+
+        if (isPassPlay) {
+          offGsis.forEach((gsis, i) => {
+            const jersey = offNums[i] || gsisToJersey[gsis] || "";
+            const espnId = jerseyTeamToEspnId[`${jersey}:${possTeamId}`]
+              || jerseyTeamToEspnId[`${jersey}:${possTeam}`] || "";
+            if (espnId) playerOffPassSnaps[espnId] = (playerOffPassSnaps[espnId] || 0) + 1;
+          });
+          defGsis.forEach((gsis, i) => {
+            const jersey = defNums[i] || gsisToJersey[gsis] || "";
+            const espnId = jerseyTeamToEspnId[`${jersey}:${defTeamId}`]
+              || jerseyTeamToEspnId[`${jersey}:${defTeamAbbr}`] || "";
+            if (espnId) playerDefPassSnaps[espnId] = (playerDefPassSnaps[espnId] || 0) + 1;
+          });
+        }
+
+        // Total defense snaps
+        defGsis.forEach((gsis, i) => {
+          const jersey = defNums[i] || gsisToJersey[gsis] || "";
+          const espnId = jerseyTeamToEspnId[`${jersey}:${defTeamId}`]
+            || jerseyTeamToEspnId[`${jersey}:${defTeamAbbr}`] || "";
+          if (espnId) playerDefTotalSnaps[espnId] = (playerDefTotalSnaps[espnId] || 0) + 1;
+        });
       }
 
       // Build snap count lookups with multiple keys for robust matching
@@ -1474,14 +1838,10 @@ export async function fetchGameData(gameId: string, forceRefresh = false): Promi
       }
 
       // ── Build snap count per individual player from participation data ──────────
-      // (teamJerseyToEspnId already built above)
-
+      // (teamJerseyToEspnId already built above — used for OL pass/run snap tracking)
       const playerTotalSnaps: Record<string, number> = {}; // espnId -> total snaps on field
       const playerPassSnaps: Record<string, number> = {};  // espnId -> offensive pass play snaps
       const playerRunSnaps: Record<string, number> = {};   // espnId -> offensive run play snaps
-      // CB/S individual pass coverage snap counts (from DEFENSE side of participation)
-      const playerDefPassSnaps: Record<string, number> = {}; // espnId -> def pass snaps
-      const playerDefTotalSnaps: Record<string, number> = {}; // espnId -> total def snaps
 
       for (const row of participationRows) {
         const hasPassPlay = !!(row["time_to_throw"]);
@@ -1498,24 +1858,6 @@ export async function fetchGameData(gameId: string, forceRefresh = false): Promi
           playerTotalSnaps[espnId] = (playerTotalSnaps[espnId] || 0) + 1;
           if (hasPassPlay) playerPassSnaps[espnId] = (playerPassSnaps[espnId] || 0) + 1;
           else playerRunSnaps[espnId] = (playerRunSnaps[espnId] || 0) + 1;
-        }
-
-        // ── Defense side (CB/S individual coverage snap tracking) ──
-        const defGsisIds = (row["defense_players"] || "").split(";");
-        const defNums = (row["defense_numbers"] || "").split(";");
-        const defAbbr = Object.keys(abbrToTeamId).find(a => a !== posTeam) || "";
-        const defTeamId = abbrToTeamId[defAbbr] || "";
-        for (let i = 0; i < defNums.length; i++) {
-          const jersey = defNums[i];
-          const gsis = defGsisIds[i];
-          if (!defTeamId) continue;
-          // Try jersey first (most reliable for this game)
-          let espnId = (teamJerseyToEspnId[defTeamId] || {})[jersey] || "";
-          // Fall back to GSIS
-          if (!espnId && gsis) espnId = gsisToEspnId[gsis] || "";
-          if (!espnId) continue;
-          playerDefTotalSnaps[espnId] = (playerDefTotalSnaps[espnId] || 0) + 1;
-          if (hasPassPlay) playerDefPassSnaps[espnId] = (playerDefPassSnaps[espnId] || 0) + 1;
         }
       }
 
@@ -1866,6 +2208,39 @@ export async function fetchGameData(gameId: string, forceRefresh = false): Promi
               player._cbStats.defenseSnaps = indivDefTotalSnaps;
             }
           }
+
+          // ── Attach WR/TE nflverse enrichment ───────────────────────────────────
+          // wrStatsFromNflverse is keyed by nflverse abbreviated name ("J.Jefferson")
+          if (["WR","TE","RB","FB"].includes(pos)) {
+            const nameParts = player.name?.split(" ") || [];
+            const nflvAbbrev = nameParts.length >= 2
+              ? `${nameParts[0][0]}.${nameParts.slice(1).join(" ")}`
+              : player.name || "";
+            const lastName2 = nameParts[nameParts.length - 1]?.toLowerCase() || "";
+            const wrData = wrStatsFromNflverse[nflvAbbrev]
+              || Object.entries(wrStatsFromNflverse).find(([k]) =>
+                   k.toLowerCase().endsWith(`.${lastName2}`)
+                 )?.[1];
+            if (wrData) player._wrStats = wrData;
+          }
+
+          // ── Attach LB/DL nflverse pass rush enrichment ────────────────────────
+          // passRusherStats is keyed by nflverse abbreviated name ("H.Reddick")
+          if (["LB","ILB","OLB","MLB","DE","DT","NT","DL","IDL","ED","S","SS","FS","SAF"].includes(pos)) {
+            const nameParts2 = player.name?.split(" ") || [];
+            const nflvAbbrev2 = nameParts2.length >= 2
+              ? `${nameParts2[0][0]}.${nameParts2.slice(1).join(" ")}`
+              : player.name || "";
+            const lastName3 = nameParts2[nameParts2.length - 1]?.toLowerCase() || "";
+            const prData = passRusherStats[nflvAbbrev2]
+              || Object.entries(passRusherStats).find(([k]) =>
+                   k.toLowerCase().endsWith(`.${lastName3}`)
+                 )?.[1];
+            if (prData) {
+              if (["LB","ILB","OLB","MLB"].includes(pos)) player._lbStats = prData;
+              else player._dlStats = prData; // DL and Safeties share the same data shape
+            }
+          }
         }
       }
 
@@ -1989,21 +2364,35 @@ export async function fetchGameData(gameId: string, forceRefresh = false): Promi
           delete p._teamCtx;
           delete p._olStats;
           delete p._cbStats;
+          delete p._wrStats;
+          delete p._lbStats;
+          delete p._dlStats;
         }
       }
 
+      // Cache it
+      storage.setGameCache({ gameId, data: JSON.stringify(result), fetchedAt: Date.now() });
+      res.json(result);
+    } catch (err: any) {
+      console.error("Game fetch error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+}
 
-  // Store in memory cache and return
+// ============================================================
+// SUNDAY SCORE ALGORITHM
+// ============================================================
+
   setCached(gameId, JSON.stringify(result));
   return result;
 }
 
-// ── Seasons helper ───────────────────────────────────────────────────────────
+// ── Seasons / Weeks / Games helpers ──────────────────────────────────────────
 export function getSeasons(): number[] {
   return getAvailableSeasons();
 }
 
-// ── Weeks helper ─────────────────────────────────────────────────────────────
 export function getWeeks() {
   const weeks: { value: string; label: string; seasonType: number }[] = [];
   for (let w = 1; w <= 18; w++) {
@@ -2016,12 +2405,10 @@ export function getWeeks() {
   return weeks;
 }
 
-// ── Games fetcher ─────────────────────────────────────────────────────────────
 export async function fetchGames(year: string, week: string) {
   const [seasonType, weekNum] = week.split("-");
   const url = `${ESPN_BASE}/scoreboard?seasontype=${seasonType}&week=${weekNum}&dates=${year}&limit=20`;
   const data = await fetchJson(url);
-
   return (data.events || [])
     .filter((e: any) => {
       const status = e.competitions?.[0]?.status?.type?.name;
@@ -2032,23 +2419,9 @@ export async function fetchGames(year: string, week: string) {
       const home = comp.competitors.find((c: any) => c.homeAway === "home");
       const away = comp.competitors.find((c: any) => c.homeAway === "away");
       return {
-        id: e.id,
-        date: e.date,
-        name: e.shortName,
-        homeTeam: {
-          id: home?.team?.id,
-          name: home?.team?.displayName,
-          abbreviation: home?.team?.abbreviation,
-          logo: home?.team?.logo,
-          score: home?.score,
-        },
-        awayTeam: {
-          id: away?.team?.id,
-          name: away?.team?.displayName,
-          abbreviation: away?.team?.abbreviation,
-          logo: away?.team?.logo,
-          score: away?.score,
-        },
+        id: e.id, date: e.date, name: e.shortName,
+        homeTeam: { id: home?.team?.id, name: home?.team?.displayName, abbreviation: home?.team?.abbreviation, logo: home?.team?.logo, score: home?.score },
+        awayTeam: { id: away?.team?.id, name: away?.team?.displayName, abbreviation: away?.team?.abbreviation, logo: away?.team?.logo, score: away?.score },
       };
     });
 }
