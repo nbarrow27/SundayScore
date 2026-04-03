@@ -1,0 +1,142 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* NFL Dark Theme — Deep midnight blue + gold accent */
+    --background: 218 28% 8%;
+    --foreground: 210 20% 95%;
+
+    --card: 218 25% 12%;
+    --card-foreground: 210 20% 92%;
+
+    --popover: 218 25% 10%;
+    --popover-foreground: 210 20% 92%;
+
+    --primary: 43 96% 56%;
+    --primary-foreground: 218 28% 8%;
+
+    --secondary: 218 22% 18%;
+    --secondary-foreground: 210 20% 85%;
+
+    --muted: 218 20% 16%;
+    --muted-foreground: 215 15% 55%;
+
+    --accent: 43 96% 56%;
+    --accent-foreground: 218 28% 8%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 210 20% 98%;
+
+    --border: 218 22% 20%;
+    --input: 218 22% 18%;
+    --ring: 43 96% 56%;
+
+    --radius: 0.5rem;
+
+    /* Score colors */
+    --score-elite: 142 71% 45%;
+    --score-great: 142 60% 50%;
+    --score-good: 82 60% 45%;
+    --score-average: 43 96% 56%;
+    --score-below: 25 95% 53%;
+    --score-poor: 0 72% 51%;
+
+    /* Field green */
+    --field-green: 142 40% 28%;
+    --field-green-alt: 142 38% 24%;
+  }
+
+  * {
+    box-sizing: border-box;
+    border-color: hsl(var(--border));
+  }
+
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    min-height: 100vh;
+  }
+
+  .dark {
+    --background: 218 28% 8%;
+    --foreground: 210 20% 95%;
+  }
+}
+
+@layer utilities {
+  .score-badge {
+    @apply rounded-md font-bold text-center leading-none;
+  }
+  
+  .score-elite { background: hsl(142 71% 45%); color: white; }
+  .score-great { background: hsl(142 60% 50%); color: white; }
+  .score-good { background: hsl(82 60% 45%); color: white; }
+  .score-average { background: hsl(43 96% 56%); color: #1a1a1a; }
+  .score-below { background: hsl(25 95% 53%); color: white; }
+  .score-poor { background: hsl(0 72% 51%); color: white; }
+
+  .glass-card {
+    background: hsl(218 25% 12% / 0.95);
+    border: 1px solid hsl(218 22% 22%);
+    backdrop-filter: blur(8px);
+  }
+
+  .field-bg {
+    background: linear-gradient(
+      180deg,
+      hsl(142 40% 25%) 0%,
+      hsl(142 38% 22%) 50%,
+      hsl(142 40% 25%) 100%
+    );
+  }
+
+  .player-card-hover {
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+
+  .player-card-hover:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px hsl(0 0% 0% / 0.4);
+  }
+
+  .shimmer {
+    background: linear-gradient(
+      90deg,
+      hsl(218 25% 14%) 0%,
+      hsl(218 25% 20%) 50%,
+      hsl(218 25% 14%) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+  }
+
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+
+  .bebas {
+    font-family: 'Bebas Neue', sans-serif;
+    letter-spacing: 0.05em;
+  }
+
+  /* Field hash marks */
+  .field-lines::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background-image: repeating-linear-gradient(
+      90deg,
+      transparent,
+      transparent calc(10% - 1px),
+      hsl(142 30% 40% / 0.3) calc(10% - 1px),
+      hsl(142 30% 40% / 0.3) 10%
+    );
+    pointer-events: none;
+  }
+}
