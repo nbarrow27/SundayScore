@@ -1,21 +1,17 @@
 // ── SundayScore shared API logic for Vercel serverless functions ──────────────
-// In-memory cache replaces SQLite (no persistent FS in serverless)
-
 const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
 const NFLVERSE_BASE = "https://github.com/nflverse/nflverse-data/releases/download";
-const CACHE_TTL = 60 * 60 * 1000; // 1 hour
+const CACHE_TTL = 60 * 60 * 1000;
 
-// ── In-memory cache ─────────────────────────────────────────────────────────
 interface CacheEntry { data: string; fetchedAt: number; }
 const gameCache: Record<string, CacheEntry> = {};
-export function getCached(gameId: string): CacheEntry | null {
-  const e = gameCache[gameId];
-  if (e && Date.now() - e.fetchedAt < CACHE_TTL) return e;
-  return null;
+export function getCached(id: string): CacheEntry | null {
+  const e = gameCache[id];
+  return (e && Date.now() - e.fetchedAt < CACHE_TTL) ? e : null;
 }
-export function setCached(gameId: string, data: string) {
-  gameCache[gameId] = { data, fetchedAt: Date.now() };
+export function setCached(id: string, data: string) {
+  gameCache[id] = { data, fetchedAt: Date.now() };
 }
 
 // Simple CSV parser that handles quoted fields
@@ -970,7 +966,6 @@ function gradeGenericDef(stats: any): number {
   return score;
 }
 
-// ── Main game data fetcher ────────────────────────────────────────────────────
 export async function fetchGameData(gameId: string, forceRefresh = false): Promise<any> {
   if (!forceRefresh) {
     const cached = getCached(gameId);
@@ -2371,33 +2366,16 @@ export async function fetchGameData(gameId: string, forceRefresh = false): Promi
       }
 
       // Cache it
-      storage.setGameCache({ gameId, data: JSON.stringify(result), fetchedAt: Date.now() });
-      res.json(result);
-    } catch (err: any) {
-      console.error("Game fetch error:", err);
-      res.status(500).json({ error: err.message });
-    }
-  });
-}
-
-// ============================================================
-// SUNDAY SCORE ALGORITHM
-// ============================================================
 
   setCached(gameId, JSON.stringify(result));
   return result;
 }
 
-// ── Seasons / Weeks / Games helpers ──────────────────────────────────────────
-export function getSeasons(): number[] {
-  return getAvailableSeasons();
-}
+export function getSeasons(): number[] { return getAvailableSeasons(); }
 
 export function getWeeks() {
   const weeks: { value: string; label: string; seasonType: number }[] = [];
-  for (let w = 1; w <= 18; w++) {
-    weeks.push({ value: `2-${w}`, label: `Week ${w}`, seasonType: 2 });
-  }
+  for (let w = 1; w <= 18; w++) weeks.push({ value: `2-${w}`, label: `Week ${w}`, seasonType: 2 });
   weeks.push({ value: "3-1", label: "Wild Card", seasonType: 3 });
   weeks.push({ value: "3-2", label: "Divisional", seasonType: 3 });
   weeks.push({ value: "3-3", label: "Championship", seasonType: 3 });
@@ -2410,10 +2388,7 @@ export async function fetchGames(year: string, week: string) {
   const url = `${ESPN_BASE}/scoreboard?seasontype=${seasonType}&week=${weekNum}&dates=${year}&limit=20`;
   const data = await fetchJson(url);
   return (data.events || [])
-    .filter((e: any) => {
-      const status = e.competitions?.[0]?.status?.type?.name;
-      return status === "STATUS_FINAL" || status === "STATUS_FULL_TIME";
-    })
+    .filter((e: any) => ["STATUS_FINAL","STATUS_FULL_TIME"].includes(e.competitions?.[0]?.status?.type?.name))
     .map((e: any) => {
       const comp = e.competitions[0];
       const home = comp.competitors.find((c: any) => c.homeAway === "home");
